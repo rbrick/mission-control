@@ -1,0 +1,21 @@
+# Go build artifacts
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+# sqlite
+*.db
+
+coverage.out
+mission-control
+
+# JSON and local data files
+*.json
+
+# OS-generated files
+.DS_Store
+# Logs
+*.log
