@@ -1,4 +1,4 @@
-module github.com/rbrick/mission-control
+module github.com/rbrick/mission-control/gateway
 
 go 1.25.1
 
