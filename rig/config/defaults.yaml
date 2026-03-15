@@ -1,6 +1,8 @@
 id: sfro-rc-91
-name: "Starfront Observatory - RedCat 91"
+display_name: "Starfront Observatory - RedCat 91"
 auth:
   token: something-super-secret
 nina:
   host: "http://localhost:5000"
+adapter:
+  type: "nina"
