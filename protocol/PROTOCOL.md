@@ -1,684 +1,483 @@
 # Mission Control Protocol
 
-Status: Draft v0.1
+## Overview
 
-## 1. Purpose
+Mission Control operates over a WebSocket connection between each rig and the gateway.
 
-Mission Control needs a protocol that cleanly separates:
-
-- AI agents, which plan and decide
-- the orchestrator/gateway, which authorizes, schedules, and routes work
-- rigs, which execute telescope/imaging operations
-- external astronomy control systems such as NINA, ASCOM, and later INDI
-
-The protocol must be:
-
-- platform-agnostic at the Mission Control layer
-- explicit about authority boundaries
-- safe for remote execution
-- versioned and evolvable
-- suitable for both human-issued commands and AI-generated plans
-
-This document defines the first protocol model for Mission Control.
-
----
-
-## 2. Core Principle
-
-**Agents do not control hardware directly.**
-
-The chain of authority is:
-
-1. User expresses intent in the app
-2. AI agent turns intent into a proposed plan
-3. Gateway/orchestrator validates and approves the plan
-4. Gateway issues structured rig commands
-5. Rig executes those commands against NINA/ASCOM/INDI adapters
-6. Rig reports state, events, and results back to the gateway
-
-So:
-
-- **agent** = planner / assistant / tool-calling intelligence
-- **rig** = telescope node / hardware executor
-- **gateway** = source of orchestration truth
-
----
-
-## 3. System Roles
-
-### 3.1 App
-
-The user-facing client.
-
-Responsibilities:
-
-- chat and operator UI
-- reviewing plans
-- approving or rejecting execution
-- viewing rig state and history
-
-The app never talks to rigs directly.
-
-### 3.2 Agent
-
-An AI planning component.
-
-Responsibilities:
-
-- interpret user intent
-- generate structured imaging plans
-- call orchestrator tools
-- explain proposed actions
-
-The agent never talks to rigs directly.
-
-### 3.3 Gateway / Orchestrator
-
-The control plane.
-
-Responsibilities:
-
-- authentication and authorization
-- rig registry
-- agent/tool interface
-- plan validation
-- approval workflow
-- scheduling and routing
-- audit log and execution history
-- state projection for app/UI
-
-The gateway is the only authority allowed to issue executable rig commands.
-
-### 3.4 Rig
-
-A telescope execution node.
-
-Responsibilities:
-
-- advertise capabilities
-- accept structured commands from gateway
-- translate commands into local adapter operations
-- report state, events, failures, and artifacts
-
-The rig does not plan. The rig executes.
-
-### 3.5 Adapter
-
-A local integration layer inside the rig.
-
-Examples:
-
-- NINA adapter
-- ASCOM adapter
-- INDI adapter
-
-Adapters are implementation details behind the rig protocol.
-
----
-
-## 4. Protocol Layers
-
-Mission Control should be treated as three separate protocols.
-
-## 4.1 Agent Protocol
-
-Between agent and gateway.
-
-Purpose:
-
-- propose plans
-- inspect rigs and capabilities
-- request validation
-- request execution after approval
-
-This is a tool/API contract, not a hardware protocol.
-
-## 4.2 Control Protocol
-
-Between gateway and rigs.
-
-Purpose:
-
-- register rigs
-- exchange health/state
-- deliver executable commands
-- report progress and results
-
-This is the main Mission Control protocol.
-
-## 4.3 Data Protocol
-
-For larger artifacts and streaming state.
-
-Purpose:
-
-- thumbnails
-- latest sub exposure
-- FITS metadata
-- logs
-- event streams
-
-This should remain separate from the core command channel.
-
----
-
-## 5. Transport Recommendation
-
-### 5.1 Agent <-> Gateway
-
-- HTTPS JSON API
-- optionally SSE or WebSocket for streaming plan updates
-
-### 5.2 App <-> Gateway
-
-- HTTPS JSON API
-- WebSocket or SSE for live status updates
-
-### 5.3 Gateway <-> Rig
-
-Recommended first transport:
-
-- HTTPS JSON
-- rig-initiated outbound connection model
-
-Reason:
-
-- easier across NAT/firewalls
-- safer for observatory PCs
-- gateway remains central authority
-
-Recommended interaction pattern:
-
-- rig registers with gateway
-- rig sends heartbeat/state updates
-- rig polls or long-polls for commands
-- rig posts command acknowledgements and results
-
-Later, this can evolve to WebSocket if needed.
-
----
-
-## 6. Identity Model
-
-Every message must carry stable identities.
-
-### 6.1 Principal IDs
-
-- `agent_id`: AI planner identity
-- `session_id`: app/chat session
-- `plan_id`: proposed plan
-- `execution_id`: approved execution instance
-- `rig_id`: logical rig identity
-- `command_id`: individual executable command
-- `event_id`: emitted state/event record
-
-### 6.2 Rule
-
-`rig_id` identifies the logical rig, not the transport connection and not the AI agent.
-
----
-
-## 7. Capability Model
-
-Rigs must advertise capabilities, not implementation brands.
-
-Examples:
-
-- `mount.slew`
-- `mount.park`
-- `camera.expose`
-- `camera.cool`
-- `filterwheel.select`
-- `focuser.move`
-- `focuser.autofocus`
-- `sequence.load`
-- `sequence.start`
-- `sequence.stop`
-- `image.preview.latest`
-- `weather.read`
-
-Optional implementation metadata may also be reported:
-
-- adapter type: `nina`, `indi`, `custom`
-- local platform: `windows`, `linux`
-- external systems: `ASCOM`, `INDI`, `Alpaca`
-
-But orchestrator decisions should target capabilities first.
-
----
-
-## 8. State Model
-
-## 8.1 Rig State
-
-Minimum canonical rig states:
-
-- `offline`
-- `idle`
-- `preparing`
-- `ready`
-- `running`
-- `paused`
-- `stopping`
-- `error`
-- `maintenance`
-
-## 8.2 Command State
-
-- `queued`
-- `dispatched`
-- `acknowledged`
-- `running`
-- `succeeded`
-- `failed`
-- `canceled`
-- `timed_out`
-
-## 8.3 Execution State
-
-- `draft`
-- `awaiting_approval`
-- `approved`
-- `scheduled`
-- `running`
-- `completed`
-- `failed`
-- `canceled`
-
----
-
-## 9. Message Families
-
-## 9.1 Rig Registration
-
-Purpose: declare a rig exists and can participate.
-
-Example shape:
-
-```json
-{
-	"protocol_version": "0.1",
-	"rig_id": "rig-west-1",
-	"display_name": "West Observatory",
-	"adapter": {
-		"type": "nina",
-		"version": "3.x"
-	},
-	"platform": {
-		"os": "windows"
-	},
-	"capabilities": [
-		"mount.slew",
-		"camera.expose",
-		"sequence.load",
-		"sequence.start",
-		"sequence.stop"
-	]
-}
-```
-
-## 9.2 Rig Heartbeat
-
-Purpose: liveness and summary health.
-
-Example:
-
-```json
-{
-	"rig_id": "rig-west-1",
-	"ts": "2026-03-15T01:02:03Z",
-	"state": "ready",
-	"health": {
-		"ok": true,
-		"issues": []
-	},
-	"sequence": {
-		"active": false
-	}
-}
-```
-
-## 9.3 Rig Status Snapshot
-
-Purpose: a richer state document for UI and orchestration.
-
-Should include:
-
-- mount state
-- camera state
-- filter state
-- guider state
-- focuser state
-- weather/safety state
-- active target
-- active sequence summary
-- latest error summary
-
-## 9.4 Rig Command
-
-Purpose: executable structured request from gateway to rig.
-
-Example envelope:
-
-```json
-{
-	"command_id": "cmd_123",
-	"execution_id": "exec_456",
-	"rig_id": "rig-west-1",
-	"type": "sequence.start",
-	"payload": {
-		"sequence_ref": "seq_abc",
-		"skip_validation": false
-	}
-}
-```
-
-## 9.5 Rig Command Result
-
-Purpose: terminal or progress result for a command.
-
-Example:
-
-```json
-{
-	"command_id": "cmd_123",
-	"rig_id": "rig-west-1",
-	"state": "succeeded",
-	"message": "sequence started",
-	"ts": "2026-03-15T01:04:10Z"
-}
-```
-
-## 9.6 Rig Event
-
-Purpose: append-only event stream.
-
-Examples:
-
-- `mount.slew.started`
-- `mount.slew.completed`
-- `camera.exposure.started`
-- `camera.exposure.completed`
-- `sequence.item.started`
-- `sequence.item.failed`
-- `safety.abort.triggered`
-
-Events should be immutable and timestamped.
-
-## 9.7 Artifact Notification
-
-Purpose: report that a new image or artifact exists.
-
-Examples:
-
-- latest sub thumbnail
-- FITS file metadata
-- plate solve result
-- autofocus run output
-
----
-
-## 10. Agent Protocol
-
-The AI agent should work in terms of tools exposed by the gateway.
-
-Recommended tool surface:
-
-- `list_rigs`
-- `get_rig_status`
-- `list_rig_capabilities`
-- `propose_imaging_plan`
-- `validate_imaging_plan`
-- `estimate_execution`
-- `request_execution_approval`
-- `start_approved_execution`
-- `cancel_execution`
-- `get_execution_status`
-
-Important rule:
-
-The agent should emit **plans**, not raw hardware instructions.
-
-Bad:
-
-- "call NINA endpoint X"
-
-Good:
-
-- "load sequence template LRGB_DSO"
-- "set target Orion Nebula"
-- "start execution on rig-west-1"
-
----
-
-## 11. Imaging Plan Model
-
-The protocol should define a gateway-owned, structured imaging plan.
-
-Suggested shape:
-
-- target
-- rig selection
-- instrument/profile selection
-- framing intent
-- filters
-- exposure settings per filter
-- counts / duration goals
-- constraints
-- calibration requirements
-- safety policy
-- operator notes
-
-Example conceptual plan:
-
-```json
-{
-	"target": {
-		"name": "Orion Nebula"
-	},
-	"rig_id": "rig-west-1",
-	"profile": "Redcat 91",
-	"sequence": {
-		"mode": "LRGB",
-		"filters": [
-			{"name": "L", "exposure_s": 60, "sub_count": 24},
-			{"name": "R", "exposure_s": 30, "sub_count": 10},
-			{"name": "G", "exposure_s": 30, "sub_count": 10},
-			{"name": "B", "exposure_s": 30, "sub_count": 10}
-		]
-	}
-}
-```
-
-The gateway then translates this into adapter-specific rig commands.
-
----
-
-## 12. Command Semantics
-
-Commands must be:
-
-- structured
-- idempotent where possible
-- auditable
-- attributable to an execution and approval chain
-
-Initial command families:
-
-- `rig.sync_state`
-- `sequence.load_template`
-- `sequence.apply_plan`
-- `sequence.start`
-- `sequence.pause`
-- `sequence.resume`
-- `sequence.stop`
-- `mount.park`
-- `mount.unpark`
-- `session.abort`
-
-Avoid exposing low-level vendor-specific commands in the public Mission Control protocol.
-
----
-
-## 13. Safety Model
-
-The protocol must support explicit safety interlocks.
-
-Examples:
-
-- weather unsafe
-- roof/dome unsafe
-- mount not parked when required
-- camera not cooled
-- guider unavailable
-- manual lock by operator
-
-The gateway may refuse to dispatch.
-The rig may refuse to execute.
-
-Both refusals must be represented as structured failures.
-
----
-
-## 14. Error Model
-
-All protocol errors should include:
-
-- machine code
-- human message
-- retriable flag
-- source
-
-Example:
-
-```json
-{
-	"error": {
-		"code": "RIG_CAPABILITY_MISSING",
-		"message": "Rig does not support sequence.apply_plan",
-		"retriable": false,
-		"source": "gateway"
-	}
-}
-```
-
-Sources:
-
-- `app`
-- `agent`
-- `gateway`
-- `rig`
-- `adapter`
-- `external_system`
-
----
-
-## 15. Versioning
-
-Every protocol exchange should include:
-
-- `protocol_version`
-- sender identity
-- timestamp
-
-Rules:
-
-- additive fields are preferred
-- receivers must ignore unknown fields
-- breaking changes require a new protocol version
-
-Suggested initial version: `0.1`
-
----
-
-## 16. Security
-
-Minimum requirements:
-
-- authenticated agents
-- authenticated rigs
-- TLS for remote transport
-- signed or token-authenticated rig requests
-- audit trail from user -> agent -> gateway -> rig command
-
-Desired audit linkage:
-
-- `session_id`
-- `agent_id`
-- `plan_id`
-- `execution_id`
-- `command_id`
-
----
-
-## 17. Recommended First Milestone
-
-Define and implement only these first:
-
-### Agent <-> Gateway
-
-- `list_rigs`
-- `get_rig_status`
-- `propose_imaging_plan`
-- `validate_imaging_plan`
-
-### Gateway <-> Rig
+The protocol has exactly three actions:
 
 - `register`
-- `heartbeat`
-- `status.snapshot`
-- `command.dispatch`
-- `command.result`
+- `keep_alive`
+- `send`
 
-### Commands
+That is the full protocol surface.
 
-- `sequence.load_template`
+`register` is how a rig establishes its identity and declares its capabilities.
+
+`keep_alive` is how a rig announces that it is still online and publishes current summary state.
+
+`send` is how commands, progress, results, errors, and unsolicited events move across the connection.
+
+## Roles
+
+There are two roles on this connection:
+
+- `rig`
+- `gateway`
+
+The rig connects outward to the gateway over WebSocket.
+
+The normal flow is:
+
+1. The rig connects to the gateway.
+2. The rig sends `register` once for the connection.
+3. The rig sends `keep_alive` periodically.
+4. The gateway sends `send` packets to issue commands.
+5. The rig sends `send` packets back with progress, results, or errors.
+
+The UI is out of scope for this document. The gateway may expose a different protocol to the UI, or it may reuse the same message model internally.
+
+## Transport
+
+- Transport: WebSocket
+- Encoding: JSON
+- Protocol version: `mc.v1`
+- Connection health: WebSocket ping/pong
+
+The application protocol does not define any extra transport heartbeat beyond `keep_alive`.
+
+`register` exists to publish rig identity and capabilities.
+
+`keep_alive` exists to publish rig presence and current state to the gateway.
+
+## Common Fields
+
+Every packet must include these fields:
+
+```json
+{
+  "v": "mc.v1",
+  "action": "register"
+}
+```
+
+### Common packet fields
+
+- `v`: protocol version
+- `action`: `register`, `keep_alive`, or `send`
+
+Most packets will also include:
+
+- `ts`: UTC timestamp in RFC3339 format
+
+Rig identity is connection-scoped.
+
+The gateway determines which internal rig record a connection belongs to through its authentication or registration context, not from a `rig_id` carried in every packet.
+
+`display_name` is also gateway-owned metadata and is not part of the wire protocol.
+
+## Action: `register`
+
+`register` is sent by the rig immediately after the WebSocket connection is established.
+
+It has three jobs:
+
+1. Identify the rig.
+2. Declare the adapter in use.
+3. Declare the command surface exposed by the rig.
+
+Each connection must begin with a `register` packet before any `keep_alive` or `send` traffic.
+
+If the rig's capabilities change while connected, the rig must send a new `register` packet with the updated capability set.
+
+`register` does not carry a gateway-owned rig identifier. The gateway binds the connection to its internal rig record out of band.
+
+### Shape
+
+```json
+{
+  "v": "mc.v1",
+  "action": "register",
+  "ts": "2026-04-24T18:00:00Z",
+  "adapter": "nina",
+  "capabilities": [
+    {
+      "namespace": "mount",
+      "commands": ["goto_radec", "goto_altaz", "park", "unpark", "abort"]
+    },
+    {
+      "namespace": "camera",
+      "commands": ["capture"]
+    },
+    {
+      "namespace": "focuser",
+      "commands": ["move", "run_autofocus"]
+    }
+  ]
+}
+```
+
+### Required fields
+
+- `ts`
+- `capabilities`
+
+### Registration rules
+
+- The gateway must not issue `send` commands to a rig until it has received `register`.
+- The latest `register` packet is the source of truth for capabilities.
+- A reconnect requires a new `register` packet.
+
+## Action: `keep_alive`
+
+`keep_alive` is sent by the rig to the gateway on a fixed interval.
+
+It has two jobs:
+
+1. Confirm the rig is still online.
+2. Publish a compact snapshot of current state.
+
+### Shape
+
+```json
+{
+  "v": "mc.v1",
+  "action": "keep_alive",
+  "ts": "2026-04-24T18:00:00Z",
+  "interval_ms": 5000,
+  "state": {
+    "connected": true,
+    "safety": "safe",
+    "active": [
+      {
+        "id": "op_123",
+        "namespace": "mount",
+        "command": "goto_radec",
+        "phase": "progress"
+      }
+    ]
+  }
+}
+```
+
+### Required fields
+
+- `ts`
+- `interval_ms`
+- `state`
+
+### `state`
+
+`state` is a compact snapshot, not a full telemetry dump.
+
+It should contain only the status the gateway needs to display availability and route commands safely.
+
+Recommended fields:
+
+- `connected`
+- `safety`
+- `active`
+- `faults`
+
+### Keep-alive timeout
+
+If the gateway does not receive a `keep_alive` from a rig within `interval_ms * 3`, the rig should be considered offline.
+
+## Action: `send`
+
+`send` is the general-purpose message packet.
+
+It is used for:
+
+- gateway to rig commands
+- rig to gateway progress updates
+- rig to gateway final results
+- rig to gateway errors
+- rig to gateway unsolicited events
+
+The protocol still has only one message action here: `send`.
+
+The meaning of a `send` packet is determined by its `phase`.
+
+## `send` Shape
+
+```json
+{
+  "v": "mc.v1",
+  "action": "send",
+  "id": "op_123",
+  "ts": "2026-04-24T18:00:01Z",
+  "namespace": "mount",
+  "command": "goto_radec",
+  "phase": "command",
+  "data": {
+    "ra_hours": 10.684,
+    "dec_degrees": 41.269,
+    "epoch": "J2000"
+  }
+}
+```
+
+### Required fields
+
+- `id`
+- `ts`
+- `namespace`
+- `command`
+- `phase`
+
+### Field meanings
+
+- `id`: correlation identifier for one command lifecycle
+- `namespace`: logical subsystem, such as `mount` or `camera`
+- `command`: operation name inside the namespace
+- `phase`: the meaning of this message
+- `data`: payload for the message
+- `error`: structured error object when `phase` is `error`
+
+## `send.phase`
+
+`send` supports these phases:
+
+- `command`
+- `progress`
+- `result`
+- `error`
+- `event`
+
+### `command`
+
+Sent by the gateway to the rig to start an operation.
+
+Example:
+
+```json
+{
+  "v": "mc.v1",
+  "action": "send",
+  "id": "op_123",
+  "ts": "2026-04-24T18:00:01Z",
+  "namespace": "mount",
+  "command": "goto_radec",
+  "phase": "command",
+  "data": {
+    "ra_hours": 10.684,
+    "dec_degrees": 41.269,
+    "epoch": "J2000"
+  }
+}
+```
+
+### `progress`
+
+Sent by the rig to report that an operation is underway.
+
+The gateway should expect zero or more `progress` packets for a command.
+
+Example:
+
+```json
+{
+  "v": "mc.v1",
+  "action": "send",
+  "id": "op_123",
+  "ts": "2026-04-24T18:00:04Z",
+  "namespace": "mount",
+  "command": "goto_radec",
+  "phase": "progress",
+  "data": {
+    "state": "slewing",
+    "progress": 0.42,
+    "mount": {
+      "ra_hours": 10.12,
+      "dec_degrees": 39.85
+    }
+  }
+}
+```
+
+### `result`
+
+Sent by the rig to indicate successful completion.
+
+`result` is terminal for the command identified by `id`.
+
+Example:
+
+```json
+{
+  "v": "mc.v1",
+  "action": "send",
+  "id": "op_123",
+  "ts": "2026-04-24T18:00:08Z",
+  "namespace": "mount",
+  "command": "goto_radec",
+  "phase": "result",
+  "data": {
+    "arrived": true
+  }
+}
+```
+
+### `error`
+
+Sent by the rig when a command fails.
+
+`error` is terminal for the command identified by `id`.
+
+Example:
+
+```json
+{
+  "v": "mc.v1",
+  "action": "send",
+  "id": "op_123",
+  "ts": "2026-04-24T18:00:03Z",
+  "namespace": "mount",
+  "command": "goto_radec",
+  "phase": "error",
+  "error": {
+    "code": "INVALID_ARGUMENT",
+    "message": "target below horizon"
+  }
+}
+```
+
+### `event`
+
+Sent by the rig for unsolicited notifications not tied to a gateway-issued command.
+
+Examples:
+
+- safety state changed
+- camera disconnected
+- sequence completed locally
+- weather warning raised
+
+Example:
+
+```json
+{
+  "v": "mc.v1",
+  "action": "send",
+  "id": "evt_9001",
+  "ts": "2026-04-24T18:01:00Z",
+  "namespace": "rig",
+  "command": "state_changed",
+  "phase": "event",
+  "data": {
+    "safety": "unsafe",
+    "reason": "rain"
+  }
+}
+```
+
+## Correlation Rules
+
+For a gateway-issued command:
+
+1. The gateway creates `id`.
+2. Every rig `progress`, `result`, or `error` packet for that command must reuse the same `id`.
+3. `result` and `error` are terminal.
+4. No further packets may be sent for that `id` after a terminal packet.
+
+This keeps command tracking simple and preserves the original request-response matching idea.
+
+## Command Model
+
+The protocol does not define separate packet types for each telescope function.
+
+Instead, the gateway sends commands into a namespace.
+
+Examples:
+
+- `mount.goto_radec`
+- `mount.goto_altaz`
+- `mount.park`
+- `mount.unpark`
+- `mount.abort`
+- `camera.capture`
 - `sequence.start`
 - `sequence.stop`
+- `focuser.move`
+- `focuser.run_autofocus`
 
-Do not start with:
+This keeps the protocol small while still allowing a rich command surface.
 
-- direct vendor-specific procedure calls
-- arbitrary agent-issued hardware actions
-- image streaming in the same protocol channel
+## Error Model
 
----
+When `phase` is `error`, the packet must include an `error` object.
 
-## 18. Naming Rules
+```json
+{
+  "code": "NOT_SUPPORTED",
+  "message": "command not supported by adapter",
+  "details": {}
+}
+```
 
-To avoid confusion:
+Recommended error codes:
 
-- use **agent** only for AI planning/execution intelligence
-- use **rig** only for telescope execution nodes
-- use **adapter** for local NINA/ASCOM/INDI integration
-- use **gateway** or **orchestrator** for the central control plane
+- `UNAUTHENTICATED`
+- `FORBIDDEN`
+- `NOT_FOUND`
+- `NOT_SUPPORTED`
+- `INVALID_ARGUMENT`
+- `BUSY`
+- `TIMEOUT`
+- `CANCELLED`
+- `HARDWARE_FAULT`
+- `INTERNAL`
+- `UNAVAILABLE`
 
-Never use `agent` to mean `rig`.
+## Capability Rules
 
----
+Capabilities are declared by the rig, not assumed by the gateway.
 
-## 19. Summary
+The gateway must treat the latest `register.capabilities` payload as the source of truth.
 
-Mission Control should define:
+If a namespace or command is absent from the latest `register`, the gateway must assume it is unavailable.
 
-1. an **agent protocol** for planning
-2. a **gateway-to-rig protocol** for execution
-3. a separate **data/artifact protocol** for images and previews
+## State Rules
 
-The key architectural rule is:
+The protocol splits rig updates into two categories:
 
-**AI agents propose and reason. Rigs execute. The gateway authorizes and orchestrates.**
+1. `register` for identity and capability declaration.
+2. `keep_alive` for periodic presence and summary state.
+3. `send` for command-specific progress and discrete events.
 
----
+This prevents the gateway from needing to infer rig health from command traffic.
 
-## 20. Next Draft Targets
+## Ordering Rules
 
-The next revision of this document should define:
+- Packets are processed in receive order on a single WebSocket connection.
+- Command lifecycles are correlated by `id`.
+- Different command IDs may interleave freely.
 
-- exact JSON schemas
-- transport auth headers
-- command retry semantics
-- event taxonomy
-- execution approval states
-- artifact delivery model
-- adapter capability mapping for NINA vs INDI
+## Minimal Command Set
+
+A minimal useful rig should probably expose at least some of these namespaces:
+
+- `rig`
+- `mount`
+- `camera`
+- `focuser`
+- `sequence`
+
+Example base commands:
+
+- `rig.get_status`
+- `mount.goto_radec`
+- `mount.abort`
+- `camera.capture`
+- `focuser.move`
+
+## Design Intent
+
+The protocol is intentionally small:
+
+- one packet for registration and capability advertisement
+- one packet for periodic presence and summary state
+- one packet for actual message exchange
+
+That keeps the wire format simple, while the namespace plus command model keeps the behavior powerful.

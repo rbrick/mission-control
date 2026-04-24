@@ -7,6 +7,7 @@ import (
 
 	"github.com/labstack/echo/v5"
 	"github.com/labstack/echo/v5/middleware"
+	"github.com/rbrick/mission-control/gateway/controllers"
 )
 
 func main() {
@@ -14,11 +15,9 @@ func main() {
 	e.Use(middleware.RequestLogger())
 	e.Use(middleware.Recover())
 
-	e.GET("/health", func(c *echo.Context) error {
-		return c.JSON(http.StatusOK, map[string]string{
-			"status": "ok",
-		})
-	})
+	v1Groups := e.Group("/v1")
+
+	controllers.Register(v1Groups)
 
 	host := os.Getenv("HOST")
 	if host == "" {
