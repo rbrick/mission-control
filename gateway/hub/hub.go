@@ -36,11 +36,12 @@ type CommandState struct {
 }
 
 type RigHub struct {
-	mu       sync.RWMutex
-	upgrader websocket.Upgrader
-	token    string
-	rigs     map[string]*connectedRig
-	commands map[string]CommandState
+	mu             sync.RWMutex
+	upgrader       websocket.Upgrader
+	token          string
+	commandTimeout time.Duration
+	rigs           map[string]*connectedRig
+	commands       map[string]CommandState
 }
 
 type connectedRig struct {
@@ -61,9 +62,10 @@ func (r *connectedRig) close() {
 
 func New(options ...Option) *RigHub {
 	h := &RigHub{
-		upgrader: websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }},
-		rigs:     map[string]*connectedRig{},
-		commands: map[string]CommandState{},
+		upgrader:       websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }},
+		commandTimeout: 30 * time.Second,
+		rigs:           map[string]*connectedRig{},
+		commands:       map[string]CommandState{},
 	}
 	for _, option := range options {
 		option(h)
@@ -76,6 +78,14 @@ type Option func(*RigHub)
 func WithToken(token string) Option {
 	return func(h *RigHub) {
 		h.token = token
+	}
+}
+
+func WithCommandTimeout(timeout time.Duration) Option {
+	return func(h *RigHub) {
+		if timeout > 0 {
+			h.commandTimeout = timeout
+		}
 	}
 }
 
@@ -184,6 +194,7 @@ func (h *RigHub) SendCommand(rigID, namespace, command string, target *protocol.
 	h.mu.Lock()
 	h.commands[id] = state
 	h.mu.Unlock()
+	h.startCommandTimeout(id)
 	select {
 	case r.send <- pkt:
 		return state, nil
@@ -226,6 +237,28 @@ func (h *RigHub) writeLoop(r *connectedRig) {
 	}
 }
 
+func (h *RigHub) startCommandTimeout(id string) {
+	time.AfterFunc(h.commandTimeout, func() {
+		now := time.Now().UTC()
+		h.mu.Lock()
+		defer h.mu.Unlock()
+
+		command, ok := h.commands[id]
+		if !ok || isTerminalPhase(command.Phase) {
+			return
+		}
+
+		command.Phase = "error"
+		command.Error = &protocol.Error{Code: "TIMEOUT", Message: "command timed out"}
+		command.UpdatedAt = now
+		h.commands[id] = command
+
+		if rig := h.rigs[command.RigID]; rig != nil {
+			delete(rig.snapshot.Active, id)
+		}
+	})
+}
+
 func (h *RigHub) handlePacket(r *connectedRig, pkt protocol.Packet) {
 	now := time.Now().UTC()
 	h.mu.Lock()
@@ -239,6 +272,9 @@ func (h *RigHub) handlePacket(r *connectedRig, pkt protocol.Packet) {
 		r.snapshot.State = pkt.State
 	case "send":
 		if pkt.ID != "" {
+			if existing, ok := h.commands[pkt.ID]; ok && isTerminalPhase(existing.Phase) {
+				return
+			}
 			cs := CommandState{ID: pkt.ID, RigID: r.id, Namespace: pkt.Namespace, Command: pkt.Command, Phase: pkt.Phase, Data: pkt.Data, Error: pkt.Error, UpdatedAt: now}
 			h.commands[pkt.ID] = cs
 			switch pkt.Phase {
@@ -249,6 +285,10 @@ func (h *RigHub) handlePacket(r *connectedRig, pkt protocol.Packet) {
 			}
 		}
 	}
+}
+
+func isTerminalPhase(phase string) bool {
+	return phase == "result" || phase == "error"
 }
 
 func (h *RigHub) authorized(r *http.Request) bool {
