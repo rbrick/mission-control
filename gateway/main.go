@@ -16,7 +16,7 @@ func main() {
 	e.Use(middleware.RequestLogger())
 	e.Use(middleware.Recover())
 
-	rigHub := hub.New()
+	rigHub := hub.New(hub.WithToken(os.Getenv("GATEWAY_RIG_TOKEN")))
 	v1Groups := e.Group("/v1")
 
 	controllers.Register(v1Groups, rigHub)

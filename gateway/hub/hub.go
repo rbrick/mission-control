@@ -38,6 +38,7 @@ type CommandState struct {
 type RigHub struct {
 	mu       sync.RWMutex
 	upgrader websocket.Upgrader
+	token    string
 	rigs     map[string]*connectedRig
 	commands map[string]CommandState
 }
@@ -49,15 +50,32 @@ type connectedRig struct {
 	snapshot RigSnapshot
 }
 
-func New() *RigHub {
-	return &RigHub{
+func New(options ...Option) *RigHub {
+	h := &RigHub{
 		upgrader: websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }},
 		rigs:     map[string]*connectedRig{},
 		commands: map[string]CommandState{},
 	}
+	for _, option := range options {
+		option(h)
+	}
+	return h
+}
+
+type Option func(*RigHub)
+
+func WithToken(token string) Option {
+	return func(h *RigHub) {
+		h.token = token
+	}
 }
 
 func (h *RigHub) ServeWS(w http.ResponseWriter, r *http.Request) error {
+	if !h.authorized(r) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return errors.New("unauthorized rig websocket")
+	}
+
 	conn, err := h.upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		return err
@@ -208,6 +226,16 @@ func (h *RigHub) handlePacket(r *connectedRig, pkt protocol.Packet) {
 			}
 		}
 	}
+}
+
+func (h *RigHub) authorized(r *http.Request) bool {
+	if h.token == "" {
+		return true
+	}
+	if r.Header.Get("Authorization") == "Bearer "+h.token {
+		return true
+	}
+	return r.URL.Query().Get("token") == h.token
 }
 
 func randomID(prefix string) string {
