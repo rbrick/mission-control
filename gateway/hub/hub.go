@@ -44,10 +44,19 @@ type RigHub struct {
 }
 
 type connectedRig struct {
-	id       string
-	conn     *websocket.Conn
-	send     chan protocol.Packet
-	snapshot RigSnapshot
+	id        string
+	conn      *websocket.Conn
+	send      chan protocol.Packet
+	done      chan struct{}
+	closeOnce sync.Once
+	snapshot  RigSnapshot
+}
+
+func (r *connectedRig) close() {
+	r.closeOnce.Do(func() {
+		close(r.done)
+		_ = r.conn.Close()
+	})
 }
 
 func New(options ...Option) *RigHub {
@@ -105,13 +114,16 @@ func (h *RigHub) ServeWS(w http.ResponseWriter, r *http.Request) error {
 		rigID = randomID("rig_")
 	}
 
-	cr := &connectedRig{id: rigID, conn: conn, send: make(chan protocol.Packet, 32)}
-	cr.snapshot = RigSnapshot{ID: rigID, Online: true, Adapter: pkt.Adapter, Capabilities: pkt.Capabilities, LastSeen: time.Now().UTC(), ConnectedAt: time.Now().UTC(), Active: map[string]CommandState{}}
+	now := time.Now().UTC()
+	cr := &connectedRig{id: rigID, conn: conn, send: make(chan protocol.Packet, 32), done: make(chan struct{})}
+	cr.snapshot = RigSnapshot{ID: rigID, Online: true, Adapter: pkt.Adapter, Capabilities: pkt.Capabilities, LastSeen: now, ConnectedAt: now, Active: map[string]CommandState{}}
 
 	h.mu.Lock()
 	if old := h.rigs[rigID]; old != nil {
-		old.conn.Close()
-		close(old.send)
+		old.close()
+		if old.snapshot.Active != nil {
+			cr.snapshot.Active = old.snapshot.Active
+		}
 	}
 	h.rigs[rigID] = cr
 	h.mu.Unlock()
@@ -161,28 +173,33 @@ func (h *RigHub) GetCommand(id string) (CommandState, bool) {
 func (h *RigHub) SendCommand(rigID, namespace, command string, target *protocol.Target, data json.RawMessage) (CommandState, error) {
 	h.mu.RLock()
 	r := h.rigs[rigID]
-	h.mu.RUnlock()
-	if r == nil {
+	if r == nil || !r.snapshot.Online {
+		h.mu.RUnlock()
 		return CommandState{}, errors.New("rig not connected")
 	}
+	h.mu.RUnlock()
 	id := randomID("op_")
 	pkt := protocol.NewCommand(id, namespace, command, target, data)
 	state := CommandState{ID: id, RigID: rigID, Namespace: namespace, Command: command, Phase: "command", Data: data, UpdatedAt: time.Now().UTC()}
 	h.mu.Lock()
 	h.commands[id] = state
 	h.mu.Unlock()
-	r.send <- pkt
-	return state, nil
+	select {
+	case r.send <- pkt:
+		return state, nil
+	case <-r.done:
+		return CommandState{}, errors.New("rig not connected")
+	}
 }
 
 func (h *RigHub) readLoop(r *connectedRig) {
 	defer func() {
-		r.conn.Close()
+		r.close()
 		h.mu.Lock()
 		if h.rigs[r.id] == r {
 			r.snapshot.Online = false
 			r.snapshot.LastSeen = time.Now().UTC()
-			delete(h.rigs, r.id)
+			r.snapshot.Active = map[string]CommandState{}
 		}
 		h.mu.Unlock()
 	}()
@@ -196,8 +213,14 @@ func (h *RigHub) readLoop(r *connectedRig) {
 }
 
 func (h *RigHub) writeLoop(r *connectedRig) {
-	for pkt := range r.send {
-		if err := r.conn.WriteJSON(pkt); err != nil {
+	for {
+		select {
+		case pkt := <-r.send:
+			if err := r.conn.WriteJSON(pkt); err != nil {
+				r.close()
+				return
+			}
+		case <-r.done:
 			return
 		}
 	}
