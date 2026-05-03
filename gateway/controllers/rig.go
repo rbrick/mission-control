@@ -1,91 +1,107 @@
 package controllers
 
 import (
+	"encoding/json"
+	"net/http"
+
 	"github.com/labstack/echo/v5"
-	"github.com/rbrick/mission-control/gateway/dto"
+	"github.com/rbrick/mission-control/gateway/hub"
+	"github.com/rbrick/mission-control/gateway/protocol"
 )
 
-/*
-What is a rig?
+type RigController struct{ hub *hub.RigHub }
 
-a rig consists of every compontent of an automated telescope.
+func RegisterRigController(group *echo.Group, h *hub.RigHub) {
+	controller := &RigController{hub: h}
 
-this would include:
-- mount
-- focuser
-- camera
+	group.GET("/rigs", controller.ListRigs)
+	group.GET("/rigs/:id", controller.GetRig)
+	group.POST("/rigs/:id/commands", controller.SendCommand)
+	group.GET("/commands", controller.ListCommands)
+	group.GET("/commands/:id", controller.GetCommand)
+	group.GET("/ws/rig", controller.RigWebSocket)
 
-and might include:
-- filter wheel
-- dome
-- weather station
-- power management
-- environmental sensors
-- safety monitor
-- guider
-
-we should include all of these in the info of the rig.
-
-a rig also may or may not support specific actions.
-
-so a rig should tell us what it supports.
-
-for our case, a rig is a node on a network.
-
-the gateway talks with the rig and acts as a control plane for the rig.
-
-sending commands to the rig and receiving telemetry from the rig.
-
-The controller for the rig should be able to tell us what the rig is, what it supports, and how to interact with it.
-
-So there are a few things the gateway needs to know about the rig:
-- what components does the rig have?
-- what actions does the rig support?
-- how do we interact with the rig?
-- what is the status of the rig?
-
-as well as be able to register & unregister the rig with the gateway and send commands to the rig.
-
-# To keep a simple protocol i think
-
-- register packet
-- send packet
-- keep alive packet (telemetry), handled over websockets
-*/
-type RigController interface {
-	Register(*dto.RegisterRigRequest) (*dto.RegisterRigResponse, *dto.Error)
-	Unregister(*dto.UnregisterRigRequest) (*dto.UnregisterRigResponse, *dto.Error)
-	Send(*dto.SendCommandRequest) (*dto.SendCommandResponse, *dto.Error)
-	Status(*dto.StatusRequest) (*dto.StatusResponse, *dto.Error)
+	// Backwards-compatible aliases while the API settles.
+	group.GET("/rig/status", controller.ListRigs)
+	group.POST("/rig/send", controller.SendCommandLegacy)
 }
 
-func RegisterRigController(group *echo.Group) {
-	controller := &rigControllerImpl{}
-
-	group.PUT("/rig/register", dto.DTO(controller.Register))
-	group.DELETE("/rig/unregister", dto.DTO(controller.Unregister))
-	group.POST("/rig/send", dto.DTO(controller.Send))
-
-	group.GET("/rig/status", dto.DTO(controller.Status))
+type sendCommandRequest struct {
+	Namespace string                 `json:"namespace"`
+	Command   string                 `json:"command"`
+	Target    *protocol.Target       `json:"target,omitempty"`
+	Data      map[string]interface{} `json:"data,omitempty"`
 }
 
-type rigControllerImpl struct {
-	// to do: implement the rig service
+func (r *RigController) ListRigs(c *echo.Context) error {
+	return c.JSON(http.StatusOK, map[string]interface{}{"rigs": r.hub.ListRigs()})
 }
 
-func (r *rigControllerImpl) Register(request *dto.RegisterRigRequest) (*dto.RegisterRigResponse, *dto.Error) {
-
-	return &dto.RegisterRigResponse{}, nil
+func (r *RigController) GetRig(c *echo.Context) error {
+	rig, ok := r.hub.GetRig(c.Param("id"))
+	if !ok {
+		return c.JSON(http.StatusNotFound, map[string]string{"error": "rig not found"})
+	}
+	return c.JSON(http.StatusOK, rig)
 }
 
-func (r *rigControllerImpl) Unregister(request *dto.UnregisterRigRequest) (*dto.UnregisterRigResponse, *dto.Error) {
-	return &dto.UnregisterRigResponse{}, nil
+func (r *RigController) SendCommand(c *echo.Context) error {
+	return r.sendCommand(c, c.Param("id"))
 }
 
-func (r *rigControllerImpl) Send(request *dto.SendCommandRequest) (*dto.SendCommandResponse, *dto.Error) {
-	return &dto.SendCommandResponse{}, nil
+func (r *RigController) ListCommands(c *echo.Context) error {
+	return c.JSON(http.StatusOK, map[string]interface{}{"commands": r.hub.ListCommands()})
 }
 
-func (r *rigControllerImpl) Status(request *dto.StatusRequest) (*dto.StatusResponse, *dto.Error) {
-	return &dto.StatusResponse{}, nil
+func (r *RigController) GetCommand(c *echo.Context) error {
+	command, ok := r.hub.GetCommand(c.Param("id"))
+	if !ok {
+		return c.JSON(http.StatusNotFound, map[string]string{"error": "command not found"})
+	}
+	return c.JSON(http.StatusOK, command)
+}
+
+func (r *RigController) SendCommandLegacy(c *echo.Context) error {
+	var body struct {
+		ID        string                 `json:"id"`
+		Namespace string                 `json:"namespace"`
+		Command   string                 `json:"command"`
+		Params    map[string]interface{} `json:"params,omitempty"`
+		Data      map[string]interface{} `json:"data,omitempty"`
+	}
+	if err := c.Bind(&body); err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+	}
+	data := body.Data
+	if data == nil {
+		data = body.Params
+	}
+	return r.dispatch(c, body.ID, body.Namespace, body.Command, nil, data)
+}
+
+func (r *RigController) sendCommand(c *echo.Context, rigID string) error {
+	var body sendCommandRequest
+	if err := c.Bind(&body); err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+	}
+	return r.dispatch(c, rigID, body.Namespace, body.Command, body.Target, body.Data)
+}
+
+func (r *RigController) dispatch(c *echo.Context, rigID, namespace, command string, target *protocol.Target, data map[string]interface{}) error {
+	if rigID == "" || namespace == "" || command == "" {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "rig id, namespace, and command are required"})
+	}
+	raw, err := json.Marshal(data)
+	if err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "invalid data"})
+	}
+	state, err := r.hub.SendCommand(rigID, namespace, command, target, raw)
+	if err != nil {
+		return c.JSON(http.StatusNotFound, map[string]string{"error": err.Error()})
+	}
+	return c.JSON(http.StatusAccepted, state)
+}
+
+func (r *RigController) RigWebSocket(c *echo.Context) error {
+	return r.hub.ServeWS(c.Response(), c.Request())
 }
