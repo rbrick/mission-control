@@ -1,0 +1,29 @@
+# Go build artifacts
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# Project binaries
+/gateway/gateway
+/gateway/mission-control
+/rig/rig
+
+# sqlite
+*.db
+*.db-shm
+*.db-wal
+
+coverage.out
+
+# JSON and local data files
+*.json
+
+# OS-generated files
+.DS_Store
+
+# Logs
+*.log
