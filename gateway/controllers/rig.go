@@ -6,7 +6,7 @@ import (
 
 	"github.com/labstack/echo/v5"
 	"github.com/rbrick/mission-control/gateway/hub"
-	"github.com/rbrick/mission-control/gateway/protocol"
+	"github.com/rbrick/mission-control/protocol"
 )
 
 type RigController struct{ hub *hub.RigHub }

@@ -15,8 +15,8 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/rbrick/mission-control/protocol"
 	"github.com/rbrick/mission-control/rig/config"
-	"github.com/rbrick/mission-control/rig/protocol"
 	"github.com/spf13/cobra"
 )
 

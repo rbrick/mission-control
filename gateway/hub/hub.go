@@ -10,7 +10,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
-	"github.com/rbrick/mission-control/gateway/protocol"
+	"github.com/rbrick/mission-control/protocol"
 )
 
 type RigSnapshot struct {
