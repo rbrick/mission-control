@@ -16,6 +16,7 @@ import (
 
 	"github.com/gorilla/websocket"
 	"github.com/rbrick/mission-control/protocol"
+	"github.com/rbrick/mission-control/rig/adapter"
 	"github.com/rbrick/mission-control/rig/config"
 	"github.com/spf13/cobra"
 )
@@ -25,17 +26,11 @@ func newConnectCmd() *cobra.Command {
 	var gatewayURL string
 	var token string
 	var keepAliveInterval time.Duration
-
-	cmd := &cobra.Command{
-		Use:   "connect",
-		Short: "Connect this rig to a Mission Control gateway",
-		RunE: func(cmd *cobra.Command, args []string) error {
-			ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
-			defer stop()
-			return runConnect(ctx, configPath, gatewayURL, token, keepAliveInterval)
-		},
-	}
-
+	cmd := &cobra.Command{Use: "connect", Short: "Connect this rig to a Mission Control gateway", RunE: func(cmd *cobra.Command, args []string) error {
+		ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
+		defer stop()
+		return runConnect(ctx, configPath, gatewayURL, token, keepAliveInterval)
+	}}
 	cmd.Flags().StringVarP(&configPath, "config", "c", "", "Path to a rig config YAML file")
 	cmd.Flags().StringVar(&gatewayURL, "gateway", defaultGatewayURL(), "Gateway rig WebSocket URL")
 	cmd.Flags().StringVar(&token, "token", os.Getenv("GATEWAY_TOKEN"), "Gateway bearer token")
@@ -55,7 +50,11 @@ func runConnect(ctx context.Context, configPath, gatewayURL, token string, keepA
 	if err != nil {
 		return err
 	}
-
+	adapters, err := adapter.FromConfig(cfg)
+	if err != nil {
+		return err
+	}
+	rig := newRigRuntime(adapters)
 	u, err := url.Parse(gatewayURL)
 	if err != nil {
 		return fmt.Errorf("parse gateway url: %w", err)
@@ -65,30 +64,23 @@ func runConnect(ctx context.Context, configPath, gatewayURL, token string, keepA
 		q.Set("id", cfg.ID)
 	}
 	u.RawQuery = q.Encode()
-
 	headers := http.Header{}
 	if token != "" {
 		headers.Set("Authorization", "Bearer "+token)
 	}
-
 	conn, _, err := websocket.DefaultDialer.DialContext(ctx, u.String(), headers)
 	if err != nil {
 		return fmt.Errorf("connect gateway: %w", err)
 	}
 	defer conn.Close()
-
 	client := &gatewayClient{conn: conn}
-
-	log.Printf("connected rig %s to gateway %s", cfg.ID, u.String())
-
-	if err := client.WriteJSON(registerPacket(cfg)); err != nil {
+	log.Printf("connected rig %s to gateway %s with %d adapter(s)", cfg.ID, u.String(), len(adapters))
+	if err := client.WriteJSON(registerPacket(cfg, adapters)); err != nil {
 		return fmt.Errorf("send register: %w", err)
 	}
-
 	errCh := make(chan error, 2)
-	go func() { errCh <- readCommands(ctx, client) }()
-	go func() { errCh <- writeKeepAlives(ctx, client, keepAliveInterval) }()
-
+	go func() { errCh <- readCommands(ctx, client, rig) }()
+	go func() { errCh <- writeKeepAlives(ctx, client, rig, keepAliveInterval) }()
 	select {
 	case <-ctx.Done():
 		return nil
@@ -100,24 +92,54 @@ func runConnect(ctx context.Context, configPath, gatewayURL, token string, keepA
 	}
 }
 
-func registerPacket(cfg *config.Config) protocol.Packet {
-	adapterID := cfg.Adapter.Type
-	if adapterID == "" {
-		adapterID = "sim"
+func registerPacket(cfg *config.Config, adapters []adapter.Adapter) protocol.Packet {
+	caps := []protocol.Capability{}
+	adapterType := ""
+	for _, a := range adapters {
+		if adapterType == "" {
+			adapterType = a.Type()
+		}
+		caps = append(caps, a.Capabilities()...)
 	}
-	return protocol.Packet{
-		V:       protocol.Version,
-		Action:  "register",
-		ID:      cfg.ID,
-		TS:      time.Now().UTC(),
-		Adapter: cfg.Adapter.Type,
-		Capabilities: []protocol.Capability{
-			{AdapterID: adapterID, Adapter: cfg.Adapter.Type, Namespace: "rig", Commands: []string{"get_status"}},
-			{AdapterID: adapterID, Adapter: cfg.Adapter.Type, Namespace: "mount", Commands: []string{"goto_radec", "park"}},
-			{AdapterID: adapterID, Adapter: cfg.Adapter.Type, Namespace: "camera", Commands: []string{"capture"}},
-			{AdapterID: adapterID, Adapter: cfg.Adapter.Type, Namespace: "sequence", Commands: []string{"start", "stop"}},
-		},
+	return protocol.Packet{V: protocol.Version, Action: "register", ID: cfg.ID, TS: time.Now().UTC(), Adapter: adapterType, Capabilities: caps}
+}
+
+type rigRuntime struct {
+	adapters map[string]adapter.Adapter
+	fallback adapter.Adapter
+}
+
+func newRigRuntime(adapters []adapter.Adapter) *rigRuntime {
+	r := &rigRuntime{adapters: map[string]adapter.Adapter{}}
+	for _, a := range adapters {
+		if r.fallback == nil {
+			r.fallback = a
+		}
+		r.adapters[a.ID()] = a
 	}
+	return r
+}
+func (r *rigRuntime) adapterFor(target *protocol.Target) adapter.Adapter {
+	if target != nil && target.AdapterID != "" {
+		if a := r.adapters[target.AdapterID]; a != nil {
+			return a
+		}
+	}
+	return r.fallback
+}
+func (r *rigRuntime) status(ctx context.Context) map[string]interface{} {
+	out := map[string]interface{}{"connected": true, "safety": "safe", "active": []interface{}{}}
+	adapters := map[string]interface{}{}
+	for id, a := range r.adapters {
+		status, err := a.Status(ctx)
+		if err != nil {
+			adapters[id] = map[string]interface{}{"error": err.Error()}
+		} else {
+			adapters[id] = status
+		}
+	}
+	out["adapters"] = adapters
+	return out
 }
 
 type gatewayClient struct {
@@ -131,7 +153,7 @@ func (c *gatewayClient) WriteJSON(v interface{}) error {
 	return c.conn.WriteJSON(v)
 }
 
-func writeKeepAlives(ctx context.Context, client *gatewayClient, interval time.Duration) error {
+func writeKeepAlives(ctx context.Context, client *gatewayClient, rig *rigRuntime, interval time.Duration) error {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
@@ -139,7 +161,7 @@ func writeKeepAlives(ctx context.Context, client *gatewayClient, interval time.D
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-ticker.C:
-			state, _ := json.Marshal(map[string]interface{}{"connected": true, "safety": "safe", "active": []interface{}{}})
+			state, _ := json.Marshal(rig.status(ctx))
 			pkt := protocol.Packet{V: protocol.Version, Action: "keep_alive", TS: time.Now().UTC(), IntervalMS: int(interval / time.Millisecond), State: state}
 			if err := client.WriteJSON(pkt); err != nil {
 				return err
@@ -148,42 +170,35 @@ func writeKeepAlives(ctx context.Context, client *gatewayClient, interval time.D
 	}
 }
 
-func readCommands(ctx context.Context, client *gatewayClient) error {
+func readCommands(ctx context.Context, client *gatewayClient, rig *rigRuntime) error {
 	for {
 		var pkt protocol.Packet
 		if err := client.conn.ReadJSON(&pkt); err != nil {
 			return err
 		}
-		if pkt.Action != "send" || pkt.Phase != "command" {
-			continue
+		if pkt.Action == "send" && pkt.Phase == "command" {
+			go handleCommand(ctx, client, rig, pkt)
 		}
-		go handleCommand(client, pkt)
 	}
 }
 
-func handleCommand(client *gatewayClient, cmd protocol.Packet) {
+func handleCommand(ctx context.Context, client *gatewayClient, rig *rigRuntime, cmd protocol.Packet) {
 	log.Printf("command %s: %s.%s", cmd.ID, cmd.Namespace, cmd.Command)
-	writeSend(client, cmd, "progress", map[string]interface{}{"state": "running", "progress": 0.25}, nil)
-	time.Sleep(500 * time.Millisecond)
-
-	switch cmd.Namespace + "." + cmd.Command {
-	case "rig.get_status":
-		writeSend(client, cmd, "result", map[string]interface{}{"connected": true, "safety": "safe", "mode": "simulated"}, nil)
-	case "mount.goto_radec":
-		writeSend(client, cmd, "progress", map[string]interface{}{"state": "slewing", "progress": 0.75}, nil)
-		time.Sleep(500 * time.Millisecond)
-		writeSend(client, cmd, "result", map[string]interface{}{"arrived": true}, nil)
-	case "mount.park":
-		writeSend(client, cmd, "result", map[string]interface{}{"parked": true}, nil)
-	case "camera.capture":
-		writeSend(client, cmd, "result", map[string]interface{}{"image_id": "simulated-image", "saved": true}, nil)
-	case "sequence.start":
-		writeSend(client, cmd, "result", map[string]interface{}{"started": true}, nil)
-	case "sequence.stop":
-		writeSend(client, cmd, "result", map[string]interface{}{"stopped": true}, nil)
-	default:
-		writeSend(client, cmd, "error", nil, &protocol.Error{Code: "NOT_SUPPORTED", Message: "command not supported by simulated rig"})
+	a := rig.adapterFor(cmd.Target)
+	if a == nil {
+		writeSend(client, cmd, "error", nil, adapter.ProtocolError("UNAVAILABLE", "no adapter configured"))
+		return
 	}
+	progress := func(phase string, data map[string]interface{}, packetErr *protocol.Error) error {
+		writeSend(client, cmd, phase, data, packetErr)
+		return nil
+	}
+	result, packetErr := a.Handle(ctx, cmd.Namespace, cmd.Command, cmd.Data, progress)
+	if packetErr != nil {
+		writeSend(client, cmd, "error", nil, packetErr)
+		return
+	}
+	writeSend(client, cmd, "result", result, nil)
 }
 
 func writeSend(client *gatewayClient, cmd protocol.Packet, phase string, data map[string]interface{}, packetErr *protocol.Error) {

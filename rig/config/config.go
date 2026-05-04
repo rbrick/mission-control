@@ -17,7 +17,9 @@ type NINAConfig struct {
 }
 
 type AdapterConfig struct {
+	ID   string `mapstructure:"id" yaml:"id,omitempty"`
 	Type string `mapstructure:"type" yaml:"type"`
+	Host string `mapstructure:"host" yaml:"host,omitempty"`
 }
 
 type AuthConfig struct {
@@ -25,11 +27,12 @@ type AuthConfig struct {
 }
 
 type Config struct {
-	ID          string        `mapstructure:"id" yaml:"id"`
-	DisplayName string        `mapstructure:"display_name" yaml:"display_name"`
-	NINA        NINAConfig    `mapstructure:"nina" yaml:"nina,omitempty"`
-	Adapter     AdapterConfig `mapstructure:"adapter" yaml:"adapter"`
-	Auth        AuthConfig    `mapstructure:"auth" yaml:"auth,omitempty"`
+	ID          string          `mapstructure:"id" yaml:"id"`
+	DisplayName string          `mapstructure:"display_name" yaml:"display_name"`
+	NINA        NINAConfig      `mapstructure:"nina" yaml:"nina,omitempty"`
+	Adapter     AdapterConfig   `mapstructure:"adapter" yaml:"adapter"`
+	Adapters    []AdapterConfig `mapstructure:"adapters" yaml:"adapters,omitempty"`
+	Auth        AuthConfig      `mapstructure:"auth" yaml:"auth,omitempty"`
 }
 
 func Load(path string) (*Config, error) {

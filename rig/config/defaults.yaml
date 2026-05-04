@@ -5,4 +5,13 @@ auth:
 nina:
   host: "http://localhost:5000"
 adapter:
-  type: "nina"
+  type: "sim"
+# For real NINA testing, either set the legacy adapter above:
+# adapter:
+#   type: "nina"
+#   host: "http://localhost:5000"
+# or use the multi-adapter shape:
+# adapters:
+#   - id: "nina_main"
+#     type: "nina"
+#     host: "http://localhost:5000"
